@@ -2,78 +2,137 @@ import { WebSocketServer, WebSocket } from "ws";
 
 const wss = new WebSocketServer({ port: 8080 });
 
+interface Room {
+  id: string;
+}
 interface User {
   id: string;
   socket: WebSocket;
-}
-
-interface Room {
-  users: User[];
+  rooms: Room[]
 }
 
 interface Message {
-  type: "join" | "message" | "system";
+  type: "join" | "message" | "leave" | "system";
   roomId: string;
-  userId?: string;
+  userId: string;
   text?: string;
 }
 
-const rooms: Record<string, Room> = {};
-
-let userCount = 0;
+let users: User[] = []
 
 wss.on("connection", (ws) => {
   let currentUser: User | null = null;
   let currentRoomId: string | null = null;
 
-  userCount += 1;
-  console.log("User connected #", userCount);
-
   ws.on("message", (data) => {
-    const message: Message = JSON.parse(data.toString());
+    try {
+      const message: Message = JSON.parse(data.toString());
+      if (message.type === "join") {
+        const { userId, roomId } = message;
+        let user = users.find(u => u.id === userId)
+        if(!user) {
+          user = {
+            id: userId,
+            socket: ws,
+            rooms: []
+          }
+          users.push(user)
+        } else {
+          user.socket = ws;
+        } 
 
-    if (message.type === "join") {
-      const { userId, roomId } = message;
+        // user exist:
+        currentUser = user
 
-      if (!rooms[roomId]) {
-        rooms[roomId] = { users: [] };
+        // find room:
+        if(!user.rooms.some(r => r.id === roomId)) {
+          user.rooms.push({id: roomId})
+        }
+
+        currentRoomId = roomId
+        console.log(`${userId} joined room: ${roomId}`);
+        broadcast(roomId, { 
+          type: "system", 
+          roomId,
+          userId: "system",
+          text: `${userId} has joined the room.` 
+        });
       }
-      currentRoomId = roomId;
-      currentUser = { id: userId!, socket: ws };
-      rooms[roomId].users.push(currentUser);
 
-      console.log(`${userId} joined room: ${roomId}`);
-      broadcast(roomId, { type: "system", text: `${userId} has joined the room.` });
-    }
-
-    if (message.type === "message") {
-      if (currentRoomId && currentUser) {
-        broadcast(currentRoomId, { type: "message", userId: currentUser.id, text: message.text });
+      if (message.type === "message") {
+        if (currentRoomId && currentUser) {
+          broadcast(currentRoomId, { type: "message", userId: currentUser.id, text: message.text });
+        }
       }
+
+      if (message.type === "leave") {
+        if (currentUser && message.roomId) {
+          leaveRoom(currentUser, message.roomId);
+          currentRoomId = null;
+        }
+      }
+    } catch (error) {
+      console.error("Error processing message:", error);
+      ws.send(JSON.stringify({
+        type: "system",
+        userId: "system",
+        text: "Error processing your message. Please check the format."
+      }));
     }
   });
 
   ws.on("close", () => {
-    if (currentUser && currentRoomId) {
-      const { id } = currentUser;
-      rooms[currentRoomId].users = rooms[currentRoomId].users.filter((user) => user.socket !== ws);
-
-      if (rooms[currentRoomId].users.length === 0) {
-        delete rooms[currentRoomId];
+    if (currentUser) {
+      // Leave all rooms when connection closes
+      currentUser.rooms.forEach(room => {
+        leaveRoom(currentUser!, room.id);
+      });
+      
+      // Remove user from global list
+      const index = users.findIndex(u => u.id === currentUser!.id);
+      if (index !== -1) {
+        users.splice(index, 1);
       }
-
-      console.log(`${id} left room: ${currentRoomId}`);
-      broadcast(currentRoomId, { type: "system", text: `${id} has left the room.` });
     }
   });
 });
 
-function broadcast(roomId: string, message: object) {
-  if (rooms[roomId]) {
-    rooms[roomId].users.forEach((user) => {
-      if (user.socket.readyState === WebSocket.OPEN) {
-        user.socket.send(JSON.stringify(message));
-      }
+
+function getUsersInRoom(roomId: string): User[] {
+  return users.filter(user => user.rooms.some(room => room.id === roomId))
+}
+function broadcast(roomId: string, msg: Omit<Message,"roomId"> & { roomId?: string}) {
+  const usersInRoom = getUsersInRoom(roomId)
+  const fullMsg = {...msg, roomId}
+
+  usersInRoom.forEach(user => {
+    if(user.socket.readyState === WebSocket.OPEN) {
+      user.socket.send(JSON.stringify(fullMsg))
+    }
+  })
+}
+
+function leaveRoom(user: User, roomId: string) {
+  const roomIndex = user.rooms.findIndex(r => r.id === roomId);
+  if (roomIndex !== -1) {
+    user.rooms.splice(roomIndex, 1);
+    console.log(`${user.id} left room: ${roomId}`);
+    
+    broadcast(roomId, { 
+      type: "system", 
+      roomId,
+      userId: "system",
+      text: `${user.id} has left the room.` 
     });
+    
+    // Notify the user they've left
+    if (user.socket.readyState === WebSocket.OPEN) {
+      user.socket.send(JSON.stringify({
+        type: "system",
+        roomId,
+        userId: "system",
+        text: `You have left room ${roomId}`
+      }));
+    }
   }
 }
